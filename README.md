@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # HIAL-2025 Course Project
 
 ## Introduction
