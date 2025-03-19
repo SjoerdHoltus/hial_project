@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # HIAL-2025 Course Project
 
 ## Introduction
@@ -191,3 +192,6 @@ More details about ActionNormalizer, ResetWrapper, and TimeLimitWrapper can be f
 ## Useful Resources
 1. (Highly recommended) You can find a clean implementation and the original paper of the Advantage-Weighted Actor-Critic (AWAC) algorithm [here](https://github.com/hari-sikchi/AWAC)
 2. You can also find the implementations of a set of other IL algorithms [here](https://github.com/HumanCompatibleAI/imitation)
+=======
+# hial_project
+>>>>>>> 74c8c1888ea043aced4a3642fa9e3cd40618b875
