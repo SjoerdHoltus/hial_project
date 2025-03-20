@@ -1,4 +1,5 @@
 import os 
+import csv
 import numpy as np
 import pybullet as p
 from moviepy.editor import ImageSequenceClip
@@ -18,6 +19,7 @@ def generate_trajectory(env, max_episode_length, save_dir, save_name, seed=None)
         traj.append((obs,act))
         obs, reward, done, info = env.step(act) # obs, reward, done, info
         t += 1
+        print(obs)
     traj.append((obs, None))
     env.close()
     if save_dir:
@@ -110,7 +112,33 @@ def generate_trajectories_from_files():
     os.chdir(CURRENT_DIR)
     return trajectories, starting_states
     
+def transform_traj(actions, states):
+    '''
+    Transforms the csv files of states and actions into a set of trajectories 
+    '''
+    actions = open_file(actions)
+    states = open_file(states)
 
+    traj = []
+
+    for i in range(len(actions)):
+        traj.append((states[i],actions[i]))
+
+    return traj
+
+def open_file(file_name):
+    '''
+    Transforms the csv file into a list where each element is a np.array consisting of floats
+    '''
+    with open(file_name, 'r') as file:
+        lines = csv.reader(file)
+        ls = []
+        for line in lines:
+            row = line[0].split(' ')
+            for i in range(len(row)):
+                row[i] = float(row[i])
+            ls.append(row)
+    return(ls)
 
 
 if __name__ == "__main__":
