@@ -109,13 +109,12 @@ def generate_trajectories_from_files():
     os.chdir(PARENT_DIR)
     os.chdir(CURRENT_DIR)
     return trajectories, starting_states
-    
 
 
-
-if __name__ == "__main__":
-    trajectories, starting_states = generate_trajectories_from_files()
-    env = init_env(render=True)
-    frames = record_trajectory(env, trajectories[19], starting_states[19])
-    clip_name = f'expert_trajectories/expert_trajectory_20.mp4'
-    generate_clip(frames, clip_name, fps=15)
+# if __name__ == "__main__":
+#     trajectories, starting_states = generate_trajectories_from_files()
+#     for i in range(len(trajectories)):
+#         env = init_env(render=True)
+#         frames = record_trajectory(env, trajectories[i], starting_states[i])
+#         clip_name = f'expert_trajectories/expert_trajectory_{i+1}.mp4'
+#         generate_clip(frames, clip_name, fps=15)

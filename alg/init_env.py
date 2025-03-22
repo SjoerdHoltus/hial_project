@@ -16,3 +16,4 @@ def init_env(render=False):
     env = TimeLimitWrapper(env=env, max_steps=150)
     return env
 
+
