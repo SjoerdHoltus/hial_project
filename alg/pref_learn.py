@@ -35,10 +35,10 @@ ENV_NAME = 'PickingBananas'
 file_path_random_traj = './random_trajectories/trajectory_'
 actions = 'action_traj.csv'
 states = 'state_traj.csv'
-learned_weights  = 'finale_feature_weights'
+learned_weights  = 'final_feature_weights.csv'
 
 env = init_env(render=False)
-env = aprel.Environment(env,feature_function)
+env = aprel.Environment(env, feature_function)
 
 # Creating a trajectory set in the correct format
 trajectory_set = []
@@ -57,7 +57,7 @@ trajectories, starting_states = generate_trajectories_from_files()
 
 # Add them to the trajectory set
 for i in range(len(trajectories)):
-    traj = aprel.Trajectory(env,trajectories[i],f'./expert_trajectories/expert_trajectory_{i}.mp4')
+    traj = aprel.Trajectory(env, trajectories[i], f'./expert_trajectories/expert_trajectory_{i}.mp4')
     trajectory_set.append(traj)
 
 trajectory_set = aprel.TrajectorySet(trajectory_set)
@@ -75,7 +75,6 @@ belief = aprel.SamplingBasedBelief(user_model, [], params)
 print('Estimated user parameters: ' + str(belief.mean))
                                        
 query = aprel.PreferenceQuery(trajectory_set[:2])
-
 for query_no in range(10):
     queries, objective_values = query_optimizer.optimize('mutual_information', belief, query)
     print('Objective Value: ' + str(objective_values[0]))
@@ -83,8 +82,6 @@ for query_no in range(10):
     responses = true_user.respond(queries[0])
     belief.update(aprel.Preference(queries[0], responses[0]))
     print('Estimated user parameters: ' + str(belief.mean))
-
+    
 with open(learned_weights, 'w', newline='') as file:
-    writer = csv.writer(file)
-    writer.writerow(["weights"])
-    writer.writerow([str(belief.mean)])
+    file.write(str(belief.mean['weights']))
