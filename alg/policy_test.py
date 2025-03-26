@@ -1,18 +1,18 @@
 import os
 import numpy as np
 import torch
-from werkende import actNet
+from policy_learn import actNet
 from init_env import init_env
 
 def load_final_policy(path_to_saved_policy):
+    """
+    Loads the final policy from a saved model file.
+    """
     full_path = os.path.join("models", path_to_saved_policy)
     
-    env = init_env(render=False)
-    o_dict = env.reset()
-    s_dim = len(o_dict["observation"]) + len(o_dict["achieved_goal"])
-    a_dim = env.action_space.shape[0]
+    s_dim = 22
+    a_dim = 4
     max_a = 1.0
-    env.close()
 
     policy_model = actNet(s_dim, a_dim, max_a)
     state_dict = torch.load(full_path, map_location=torch.device('cpu'))
@@ -21,6 +21,9 @@ def load_final_policy(path_to_saved_policy):
     return policy_model
 
 def get_policy_action(state, saved_policy_model):
+    """
+    Gets the action from the policy model for a given state.
+    """
     observation = state["observation"]
     achieved_goal = state["achieved_goal"]
     flattened_state = np.concatenate([observation, achieved_goal])
@@ -32,3 +35,6 @@ def get_policy_action(state, saved_policy_model):
     
     action = action_tensor.cpu().numpy().squeeze(0)
     return action
+
+
+
