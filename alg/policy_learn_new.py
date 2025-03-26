@@ -2,21 +2,26 @@
 # policy_learn.py
 #############################################
 
-import os
+from copy import deepcopy
+import itertools
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import matplotlib.pyplot as plt  # for plotting at the end
+from torch.optim import Adam
+import d4rl
+import gym
+import time
+import core as core
+from utils.logx import EpochLogger
+import torch.nn.functional as F
+import os
+import warnings
+from termcolor import colored
 
 # Adjust these imports to match your local file names/structure
 from feature_func import feature_function
 from trajectory_utils import generate_trajectories_from_files
 from init_env import init_env
 
-################################################################################
-# 1) Load Learned Weights
-################################################################################
 def load_learned_weights(path="final_feature_weights.csv"):
     """
     Loads the learned weights from CSV, which is assumed to contain a
@@ -43,9 +48,6 @@ def compute_learned_reward(traj_step, weights):
     return float(phi @ weights)
 
 
-################################################################################
-# 2) Minimal Replay Buffer
-################################################################################
 class ReplayBuffer:
     def __init__(self, max_size=int(1e6)):
         self.max_size = max_size
@@ -78,298 +80,370 @@ class ReplayBuffer:
                 np.array(next_states, dtype=np.float32),
                 np.array(dones, dtype=np.float32).reshape(-1, 1))
 
+class AWAC:
 
-################################################################################
-# 3) DDPG Networks
-################################################################################
-def mlp(input_dim, output_dim, hidden_dims=[256,256], activation=nn.ReLU):
-    layers = []
-    prev_dim = input_dim
-    for h in hidden_dims:
-        layers.append(nn.Linear(prev_dim, h))
-        layers.append(activation())
-        prev_dim = h
-    layers.append(nn.Linear(prev_dim, output_dim))
-    return nn.Sequential(*layers)
-
-
-class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, max_action):
-        super().__init__()
-        self.net = mlp(state_dim, action_dim, [256,256], activation=nn.ReLU)
-        self.max_action = max_action
-    
-    def forward(self, x):
-        # DDPG typically uses tanh on the last layer
-        return self.max_action * torch.tanh(self.net(x))
-
-
-class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super().__init__()
-        self.net = mlp(state_dim + action_dim, 1, [256,256], activation=nn.ReLU)
-    
-    def forward(self, state, action):
-        return self.net(torch.cat([state, action], dim=1))
+    def __init__(self, env_fn, actor_critic=core.MLPActorCritic,
+                 ac_kwargs=dict(),
+                 seed=0,
+                 steps_per_epoch=100,
+                 epochs=10000,
+                 replay_size=int(2000000),
+                 gamma=0.99,
+                 polyak=0.995,
+                 lr=3e-4,
+                 p_lr=3e-4,
+                 alpha=0.0,
+                 batch_size=1024,
+                 start_steps=10000,
+                 update_after=0,
+                 update_every=50,
+                 num_test_episodes=10,
+                 max_ep_len=1000,
+                 logger_kwargs=dict(),
+                 save_freq=1,
+                 algo='SAC'):
+        """
+        Soft Actor-Critic (SAC)
 
 
-################################################################################
-# 4) DDPG Agent
-################################################################################
-class DDPGAgent:
-    def __init__(self, state_dim, action_dim, max_action=1.0, gamma=0.99, tau=0.005, lr=1e-3):
-        self.actor = Actor(state_dim, action_dim, max_action)
-        self.actor_target = Actor(state_dim, action_dim, max_action)
-        self.actor_target.load_state_dict(self.actor.state_dict())
+        Args:
+            env_fn : A function which creates a copy of the environment.
+                The environment must satisfy the OpenAI Gym API.
 
-        self.critic = Critic(state_dim, action_dim)
-        self.critic_target = Critic(state_dim, action_dim)
-        self.critic_target.load_state_dict(self.critic.state_dict())
+            actor_critic: The constructor method for a PyTorch Module with an ``act`` 
+                method, a ``pi`` module, a ``q1`` module, and a ``q2`` module.
+                The ``act`` method and ``pi`` module should accept batches of 
+                observations as inputs, and ``q1`` and ``q2`` should accept a batch 
+                of observations and a batch of actions as inputs. When called, 
+                ``act``, ``q1``, and ``q2`` should return:
 
-        self.actor_opt = optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=lr)
+                ===========  ================  ======================================
+                Call         Output Shape      Description
+                ===========  ================  ======================================
+                ``act``      (batch, act_dim)  | Numpy array of actions for each 
+                                            | observation.
+                ``q1``       (batch,)          | Tensor containing one current estimate
+                                            | of Q* for the provided observations
+                                            | and actions. (Critical: make sure to
+                                            | flatten this!)
+                ``q2``       (batch,)          | Tensor containing the other current 
+                                            | estimate of Q* for the provided observations
+                                            | and actions. (Critical: make sure to
+                                            | flatten this!)
+                ===========  ================  ======================================
 
+                Calling ``pi`` should return:
+
+                ===========  ================  ======================================
+                Symbol       Shape             Description
+                ===========  ================  ======================================
+                ``a``        (batch, act_dim)  | Tensor containing actions from policy
+                                            | given observations.
+                ``logp_pi``  (batch,)          | Tensor containing log probabilities of
+                                            | actions in ``a``. Importantly: gradients
+                                            | should be able to flow back into ``a``.
+                ===========  ================  ======================================
+
+            ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
+                you provided to SAC.
+
+            seed (int): Seed for random number generators.
+
+            steps_per_epoch (int): Number of steps of interaction (state-action pairs) 
+                for the agent and the environment in each epoch.
+
+            epochs (int): Number of epochs to run and train agent.
+
+            replay_size (int): Maximum length of replay buffer.
+
+            gamma (float): Discount factor. (Always between 0 and 1.)
+
+            polyak (float): Interpolation factor in polyak averaging for target 
+                networks. Target networks are updated towards main networks 
+                according to:
+
+                .. math:: \\theta_{\\text{targ}} \\leftarrow 
+                    \\rho \\theta_{\\text{targ}} + (1-\\rho) \\theta
+
+                where :math:`\\rho` is polyak. (Always between 0 and 1, usually 
+                close to 1.)
+
+            lr (float): Learning rate (used for both policy and value learning).
+
+            alpha (float): Entropy regularization coefficient. (Equivalent to 
+                inverse of reward scale in the original SAC paper.)
+
+            batch_size (int): Minibatch size for SGD.
+
+            start_steps (int): Number of steps for uniform-random action selection,
+                before running real policy. Helps exploration.
+
+            update_after (int): Number of env interactions to collect before
+                starting to do gradient descent updates. Ensures replay buffer
+                is full enough for useful updates.
+
+            update_every (int): Number of env interactions that should elapse
+                between gradient descent updates. Note: Regardless of how long 
+                you wait between updates, the ratio of env steps to gradient steps 
+                is locked to 1.
+
+            num_test_episodes (int): Number of episodes to test the deterministic
+                policy at the end of each epoch.
+
+            max_ep_len (int): Maximum length of trajectory / episode / rollout.
+
+            logger_kwargs (dict): Keyword args for EpochLogger.
+
+            save_freq (int): How often (in terms of gap between epochs) to save
+                the current policy and value function.
+
+            """
+
+        self.logger = EpochLogger(**logger_kwargs)
+        self.logger.save_config(locals())
+
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        self.env, self.test_env = env_fn(), env_fn()
+        self.obs_dim = self.env.observation_space.shape
+        self.act_dim = self.env.action_space.shape[0]
+
+        # Action limit for clamping: critically, assumes all dimensions share the same bound!
+        self.act_limit = self.env.action_space.high[0]
+
+        # Create actor-critic module and target networks
+        self.ac = actor_critic(self.env.observation_space, self.env.action_space,
+                               special_policy='awac', **ac_kwargs)
+        self.ac_targ = actor_critic(self.env.observation_space, self.env.action_space,
+                                    special_policy='awac', **ac_kwargs)
+        self.ac_targ.load_state_dict(self.ac.state_dict())
         self.gamma = gamma
-        self.tau = tau
-        self.max_action = max_action
 
-    def select_action(self, state, noise_scale=0.1):
-        """
-        Selects action for a single state (np array).
-        Adds some exploration noise if noise_scale > 0.
-        """
-        state_t = torch.FloatTensor(state).unsqueeze(0)
-        action = self.actor(state_t).detach().cpu().numpy()[0]
-        # Add exploration noise
-        action += noise_scale * np.random.randn(len(action))
-        # Clip if needed
-        action = np.clip(action, -self.max_action, self.max_action)
-        return action
+        # Freeze target networks with respect to optimizers (only update via polyak averaging)
+        for p in self.ac_targ.parameters():
+            p.requires_grad = False
 
-    def update(self, replay_buffer, batch_size=64):
-        # Sample from replay
-        states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
+        # List of parameters for both Q-networks (save this for convenience)
+        self.q_params = itertools.chain(self.ac.q1.parameters(), self.ac.q2.parameters())
 
-        states_t = torch.FloatTensor(states)
-        actions_t = torch.FloatTensor(actions)
-        rewards_t = torch.FloatTensor(rewards)
-        next_states_t = torch.FloatTensor(next_states)
-        dones_t = torch.FloatTensor(dones)
+        # Experience buffer
+        self.replay_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim,
+                                          size=replay_size)
 
-        # Critic loss
+        # Count variables (protip: try to get a feel for how different size networks behave!)
+        var_counts = tuple(
+            core.count_vars(module) for module in [self.ac.pi, self.ac.q1, self.ac.q2])
+        self.logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n' % var_counts)
+        self.algo = algo
+
+        self.p_lr = p_lr
+        self.lr = lr
+        self.alpha = 0
+        # # Algorithm specific hyperparams
+
+        # Set up optimizers for policy and q-function
+        self.pi_optimizer = Adam(self.ac.pi.parameters(), lr=self.p_lr, weight_decay=1e-4)
+        self.q_optimizer = Adam(self.q_params, lr=self.lr)
+        self.num_test_episodes = num_test_episodes
+        self.max_ep_len = max_ep_len
+        self.epochs = epochs
+        self.steps_per_epoch = steps_per_epoch
+        self.update_after = update_after
+        self.update_every = update_every
+        self.batch_size = batch_size
+        self.save_freq = save_freq
+        self.polyak = polyak
+        # Set up model saving
+        self.logger.setup_pytorch_saver(self.ac)
+        print("Running Offline RL algorithm: {}".format(self.algo))
+
+    def populate_replay_buffer(self, env_name):
+        data_envs = {
+            'HalfCheetah-v2': (
+                "awac_data/hc_action_noise_15.npy",
+                "awac_data/hc_off_policy_15_demos_100.npy"),
+            'Ant-v2': (
+                "awac_data/ant_action_noise_15.npy",
+                "awac_data/ant_off_policy_15_demos_100.npy"),
+            'Walker2d-v2': (
+                "awac_data/walker_action_noise_15.npy",
+                "awac_data/walker_off_policy_15_demos_100.npy"),
+        }
+        if env_name in data_envs:
+            print('Loading saved data')
+            for file in data_envs[env_name]:
+                if not os.path.exists(file):
+                    warnings.warn(colored('Offline data not found. Follow awac_data/instructions.txt to download. Running without offline data.', 'red'))
+                    break
+                data = np.load(file, allow_pickle=True)
+                for demo in data:
+                    for transition in list(zip(demo['observations'], demo['actions'], demo['rewards'],
+                                               demo['next_observations'], demo['terminals'])):
+                        self.replay_buffer.store(*transition)
+        else:
+            dataset = d4rl.qlearning_dataset(self.env)
+            N = dataset['rewards'].shape[0]
+            for i in range(N):
+                self.replay_buffer.store(dataset['observations'][i], dataset['actions'][i],
+                                         dataset['rewards'][i], dataset['next_observations'][i],
+                                         float(dataset['terminals'][i]))
+            print("Loaded dataset")
+
+    # Set up function for computing SAC Q-losses
+    def compute_loss_q(self, data):
+        o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+
+        q1 = self.ac.q1(o, a)
+        q2 = self.ac.q2(o, a)
+
+        # Bellman backup for Q functions
         with torch.no_grad():
-            next_actions = self.actor_target(next_states_t)
-            target_Q = self.critic_target(next_states_t, next_actions)
-            target_Q = rewards_t + self.gamma * (1 - dones_t) * target_Q
+            # Target actions come from *current* policy
+            a2, logp_a2 = self.ac.pi(o2)
 
-        current_Q = self.critic(states_t, actions_t)
-        critic_loss = nn.MSELoss()(current_Q, target_Q)
+            # Target Q-values
+            q1_pi_targ = self.ac_targ.q1(o2, a2)
+            q2_pi_targ = self.ac_targ.q2(o2, a2)
+            q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
+            backup = r + self.gamma * (1 - d) * (q_pi_targ - self.alpha * logp_a2)
 
-        self.critic_opt.zero_grad()
-        critic_loss.backward()
-        self.critic_opt.step()
+        # MSE loss against Bellman backup
+        loss_q1 = ((q1 - backup) ** 2).mean()
+        loss_q2 = ((q2 - backup) ** 2).mean()
+        loss_q = loss_q1 + loss_q2
 
-        # Actor loss (maximize Q => minimize -Q)
-        actor_loss = -self.critic(states_t, self.actor(states_t)).mean()
+        # Useful info for logging
+        q_info = dict(Q1Vals=q1.detach().numpy(),
+                      Q2Vals=q2.detach().numpy())
 
-        self.actor_opt.zero_grad()
-        actor_loss.backward()
-        self.actor_opt.step()
+        return loss_q, q_info
 
-        # Update target networks
-        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-        for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+    # Set up function for computing SAC pi loss
+    def compute_loss_pi(self, data):
+        o = data['obs']
 
-        # (Optional) If you want to print losses:
-        # print(f"Critic Loss: {critic_loss.item():.4f}, Actor Loss: {actor_loss.item():.4f}")
+        pi, logp_pi = self.ac.pi(o)
+        q1_pi = self.ac.q1(o, pi)
+        q2_pi = self.ac.q2(o, pi)
+        v_pi = torch.min(q1_pi, q2_pi)
 
+        beta = 2
+        q1_old_actions = self.ac.q1(o, data['act'])
+        q2_old_actions = self.ac.q2(o, data['act'])
+        q_old_actions = torch.min(q1_old_actions, q2_old_actions)
 
-################################################################################
-# 5) Evaluation
-################################################################################
-def evaluate_policy(agent, env, num_rollouts=10):
-    """
-    Rolls out the current policy for 'num_rollouts' episodes
-    and returns the average success rate.
-    """
-    successes = 0
-    for _ in range(num_rollouts):
-        obs_dict = env.reset()  # { "observation", "achieved_goal", "desired_goal" }
-        obs = np.concatenate([obs_dict["observation"], obs_dict["achieved_goal"]])
-        done = False
-        steps = 0
-        info = {}
-        while not done and steps < 150:
-            action = agent.select_action(obs, noise_scale=0.0)  # no noise at test
-            next_obs_dict, _, done, info = env.step(action)
-            obs = np.concatenate([next_obs_dict["observation"], next_obs_dict["achieved_goal"]])
-            steps += 1
+        adv_pi = q_old_actions - v_pi
+        weights = F.softmax(adv_pi / beta, dim=0)
+        policy_logpp = self.ac.pi.get_logprob(o, data['act'])
+        loss_pi = (-policy_logpp * len(weights) * weights.detach()).mean()
 
-        # If your environment sets "info['is_success']" or some other success indicator, check it:
-        if "is_success" in info and info["is_success"]:
-            successes += 1
+        # Useful info for logging
+        pi_info = dict(LogPi=policy_logpp.detach().numpy())
 
-    return successes / num_rollouts
+        return loss_pi, pi_info
 
+    def update(self, data, update_timestep):
+        # First run one gradient descent step for Q1 and Q2
+        self.q_optimizer.zero_grad()
+        loss_q, q_info = self.compute_loss_q(data)
+        loss_q.backward()
+        self.q_optimizer.step()
 
-################################################################################
-# 6) Main Training Loop + Plot
-################################################################################
-if __name__ == "__main__":
+        # Record things
+        self.logger.store(LossQ=loss_q.item(), **q_info)
+        # Freeze Q-networks so you don't waste computational effort
+        # computing gradients for them during the policy learning step.
+        for p in self.q_params:
+            p.requires_grad = False
 
-    ############################
-    # (a) Load Learned Weights
-    ############################
-    w = load_learned_weights("final_feature_weights.csv")
-    print("Loaded learned weights:", w)
+        # Next run one gradient descent step for pi.
+        self.pi_optimizer.zero_grad()
+        loss_pi, pi_info = self.compute_loss_pi(data)
+        loss_pi.backward()
+        self.pi_optimizer.step()
 
-    ############################
-    # (b) Init environment
-    ############################
-    env = init_env(render=False)
-    obs_dict = env.reset()
-    # Flatten (observation + achieved_goal)
-    obs_dim = len(obs_dict["observation"]) + len(obs_dict["achieved_goal"])
-    act_dim = env.action_space.shape[0]   # should be 4
-    max_action = 1.0  # Because ActionNormalizer scales your actions to [-1, 1]
+        # Unfreeze Q-networks so you can optimize it at next DDPG step.
+        for p in self.q_params:
+            p.requires_grad = True
 
-    ############################
-    # (c) Create Agent
-    ############################
-    agent = DDPGAgent(
-        state_dim=obs_dim,
-        action_dim=act_dim,
-        max_action=max_action,
-        gamma=0.99,
-        tau=0.005,
-        lr=1e-3,
-    )
+        # Record things
+        self.logger.store(LossPi=loss_pi.item(), **pi_info)
 
-    ############################
-    # (d) Replay Buffer & Demonstrations
-    ############################
-    replay_buffer = ReplayBuffer()
+        # Finally, update target networks by polyak averaging.
+        with torch.no_grad():
+            for p, p_targ in zip(self.ac.parameters(), self.ac_targ.parameters()):
+                # NB: We use an in-place operations "mul_", "add_" to update target
+                # params, as opposed to "mul" and "add", which would make new tensors.
+                p_targ.data.mul_(self.polyak)
+                p_targ.data.add_((1 - self.polyak) * p.data)
 
-    # Load the 20 expert demonstrations
-    demos, starting_states = generate_trajectories_from_files()
-    print(f"Loaded {len(demos)} demonstration trajectories.")
+    def get_action(self, o, deterministic=False):
+        return self.ac.act(torch.as_tensor(o, dtype=torch.float32), deterministic)
 
-    # Fill replay buffer with demo transitions (using learned reward)
-    for traj in demos:
-        for i in range(len(traj) - 1):
-            state_vec = np.array(traj[i][0], dtype=np.float32)
-            action_vec = np.array(traj[i][1], dtype=np.float32)
-            next_state_vec = np.array(traj[i+1][0], dtype=np.float32)
+    def test_agent(self):
+        for j in range(self.num_test_episodes):
+            o, d, ep_ret, ep_len = self.test_env.reset(), False, 0, 0
+            while not (d or (ep_len == self.max_ep_len)):
+                # Take deterministic actions at test time
+                o, r, d, _ = self.test_env.step(self.get_action(o, True))
+                ep_ret += r
+                ep_len += 1
+            self.logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)  # Get unnormalized score
 
-            # Mark done if it's the final step in the trajectory
-            done = (i == (len(traj) - 2))
+            # self.logger.store(TestEpRet=100*self.test_env.get_normalized_score(ep_ret), TestEpLen=ep_len)  # Get normalized score
 
-            # Convert to single-step input for compute_learned_reward
-            s_a = (state_vec, action_vec)
-            r = compute_learned_reward(s_a, w)
+    def run(self):
+        # Prepare for interaction with environment
+        total_steps = self.epochs * self.steps_per_epoch
+        start_time = time.time()
+        obs, ep_ret, ep_len = self.env.reset(), 0, 0
+        done = True
+        num_train_episodes = 0
 
-            replay_buffer.add(state_vec, action_vec, r, next_state_vec, done)
+        # Main loop: collect experience in env and update/log each epoch
+        for t in range(total_steps):
 
-    print(f"Replay buffer size after adding demos: {len(replay_buffer.storage)}")
+            # Reset stuff if necessary
+            if done and t > 0:
+                self.logger.store(ExplEpRet=ep_ret, ExplEpLen=ep_len)
 
-    ############################
-    # (e) (Optional) Pre-train
-    ############################
-    pretrain_steps = 10000
-    print(f"Pre-training on demos for {pretrain_steps} updates...")
-    for step in range(pretrain_steps):
-        agent.update(replay_buffer, batch_size=64)
-        if (step+1) % 1000 == 0:
-            print(f"  Pre-training progress: {step+1}/{pretrain_steps} updates.")
-    print("Pre-training done.")
+                obs, ep_ret, ep_len = self.env.reset(), 0, 0
+                num_train_episodes += 1
 
-    ############################
-    # (f) Online Training
-    ############################
-    max_env_steps = 500000     # *** up to 500k steps ***
-    episode_length = 150
-    steps_so_far = 0
-    episode_count = 0
-    updates_per_episode = 50
+            # Collect experience
+            act = self.get_action(obs, deterministic=False)
+            next_obs, rew, done, info = self.env.step(act)
 
-    # We'll evaluate success & save policy every 1k steps
-    evaluate_interval = 1000
-
-    # We'll store (env_steps, success_rate) to plot later
-    success_rates = []
-
-    while steps_so_far < max_env_steps:
-        episode_count += 1
-
-        # Reset environment & prepare for rollout
-        obs_dict = env.reset()
-        obs = np.concatenate([obs_dict["observation"], obs_dict["achieved_goal"]])
-        done = False
-        ep_steps = 0
-        ep_reward = 0.0  # sum of learned rewards this episode
-
-        while not done and ep_steps < episode_length:
-            # 1) Select action
-            action = agent.select_action(obs, noise_scale=0.1)
-
-            # 2) Step environment
-            next_obs_dict, _, env_done, info = env.step(action)
-            next_obs = np.concatenate([next_obs_dict["observation"], next_obs_dict["achieved_goal"]])
-
-            # 3) Compute learned reward
-            s_a = (obs, action)
-            learned_r = compute_learned_reward(s_a, w)
-
-            # 4) Add to replay
-            done = env_done
-            replay_buffer.add(obs, action, learned_r, next_obs, done)
-
-            # Accumulate reward for debugging
-            ep_reward += learned_r
-
-            # Move on
+            self.replay_buffer.store(obs, act, rew, next_obs, done)
             obs = next_obs
-            ep_steps += 1
-            steps_so_far += 1
 
-        # Print episode info
-        print(f"[Episode {episode_count}] steps_in_ep: {ep_steps}, total_env_steps: {steps_so_far}, "
-              f"episode_learned_reward: {ep_reward:.2f}")
+            # Update handling
+            if t > self.update_after and t % self.update_every == 0:
+                for _ in range(self.update_every):
+                    batch = self.replay_buffer.sample_batch(self.batch_size)
+                    self.update(data=batch, update_timestep=t)
 
-        # 5) Update policy after the episode
-        for _ in range(updates_per_episode):
-            agent.update(replay_buffer, batch_size=64)
+            # End of epoch handling
+            if (t + 1) % self.steps_per_epoch == 0:
+                epoch = (t + 1) // self.steps_per_epoch
 
-        # 6) Evaluate & Save every 1k steps
-        if steps_so_far % evaluate_interval == 0:
-            # Evaluate policy on 10 test runs
-            success_rate = evaluate_policy(agent, env, num_rollouts=10)
-            success_rates.append((steps_so_far, success_rate))
-            print(f"*** EVAL *** Env Steps: {steps_so_far} | Success Rate: {success_rate:.2f}")
+                # Save model
+                if (epoch % self.save_freq == 0) or (epoch == self.epochs):
+                    self.logger.save_state({'env': self.env}, None)
 
-            # Save model checkpoints
-            torch.save(agent.actor.state_dict(), f"checkpoint_actor_{steps_so_far}.pth")
-            torch.save(agent.critic.state_dict(), f"checkpoint_critic_{steps_so_far}.pth")
+                # Test the performance of the deterministic version of the agent.
+                self.test_agent()
 
-    print("Training complete!")
-    if success_rates:
-        print("Final success rate at last eval:", success_rates[-1])
-    else:
-        print("No evaluations were performed.")
-
-    ############################
-    # (g) Plot Learning Curve
-    ############################
-    if success_rates:
-        x_vals = [t[0] for t in success_rates]  # environment steps
-        y_vals = [t[1] for t in success_rates]  # success rates
-        plt.plot(x_vals, y_vals, marker='o')
-        plt.xlabel("Environment Steps")
-        plt.ylabel("Average Success Rate (out of 10 test runs)")
-        plt.title("Policy Learning Curve")
-        plt.grid(True)
-        plt.show()
-    else:
-        print("No success rate data to plot!")
+                # Log info about epoch
+                self.logger.log_tabular('Epoch', epoch)
+                self.logger.log_tabular('TestEpRet', with_min_and_max=True)
+                self.logger.log_tabular('TestEpLen', average_only=True)
+                self.logger.log_tabular('TotalUpdates', t)
+                self.logger.log_tabular('Q1Vals', with_min_and_max=True)
+                self.logger.log_tabular('Q2Vals', with_min_and_max=True)
+                self.logger.log_tabular('LogPi', with_min_and_max=True)
+                self.logger.log_tabular('LossPi', average_only=True)
+                self.logger.log_tabular('LossQ', average_only=True)
+                self.logger.log_tabular('Time', time.time() - start_time)
+                self.logger.dump_tabular()
