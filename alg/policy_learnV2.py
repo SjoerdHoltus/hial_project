@@ -29,9 +29,9 @@ BATCH_SIZE = 256
 BUFFER_SIZE = 100_000
 GAMMA = 0.99
 TAU = 0.005
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 0.001
 HIDDEN_DIM = 256
-AWAC_LAMBDA = 1.0
+AWAC_LAMBDA = 0.5
 
 class RewardCalculator:
     def __init__(self, weights_file='final_feature_weights.csv'):
@@ -43,18 +43,21 @@ class RewardCalculator:
         print(f"Loaded feature weights: {self.weights}")
 
     def calculate_reward(self, state, next_state):
-        # Calculate features and feature differences
         current_features = feature_function([(state, None)])
         next_features = feature_function([(next_state, None)])
         feature_delta = next_features - current_features
-        
-        # Calculate reward
         reward = float(np.dot(self.weights, feature_delta))
-        
-        # Add bonus for task completion
         if self.is_success(next_state):
             reward += 10.0
-            
+        
+        # Debug: print reward details for the first few calls
+        if hasattr(self, 'debug_count'):
+            if self.debug_count < 5:
+                print(f"Feature delta: {feature_delta}, Reward: {reward}")
+                self.debug_count += 1
+        else:
+            self.debug_count = 1
+        
         return reward
 
     def is_success(self, state):
@@ -87,14 +90,25 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.max_size)
 
     def sample(self, batch_size):
-        # Sample both demonstrations and policy data
+        demo_idx_all = np.where(self.is_demo == 1)[0]
+        policy_idx_all = np.where(self.is_demo == 0)[0]
+
         demo_batch_size = batch_size // 4
         policy_batch_size = batch_size - demo_batch_size
-        
-        demo_idx = np.random.choice(np.where(self.is_demo == 1)[0], size=demo_batch_size)
-        policy_idx = np.random.choice(np.where(self.is_demo == 0)[0], size=policy_batch_size)
-        idx = np.concatenate([demo_idx, policy_idx])
-        
+
+        # Adjust demo batch size if not enough demo samples are available
+        if len(demo_idx_all) < demo_batch_size:
+            demo_batch_size = len(demo_idx_all)
+            policy_batch_size = batch_size - demo_batch_size
+
+        # If no demos available, sample only from policy transitions
+        if demo_batch_size == 0:
+            idx = np.random.choice(policy_idx_all, size=batch_size, replace=False)
+        else:
+            demo_idx = np.random.choice(demo_idx_all, size=demo_batch_size, replace=False)
+            policy_idx = np.random.choice(policy_idx_all, size=policy_batch_size, replace=False)
+            idx = np.concatenate([demo_idx, policy_idx])
+
         return (
             torch.FloatTensor(self.state[idx]).to(DEVICE),
             torch.FloatTensor(self.action[idx]).to(DEVICE),
@@ -103,6 +117,7 @@ class ReplayBuffer:
             torch.FloatTensor(self.done[idx]).to(DEVICE),
             torch.FloatTensor(self.is_demo[idx]).to(DEVICE)
         )
+
 
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim):
@@ -127,6 +142,15 @@ class Actor(nn.Module):
         normal = Normal(mean, std)
         action = normal.rsample()
         return torch.tanh(action)
+
+    def sample_with_log_prob(self, state):
+        mean, std = self.forward(state)
+        normal = Normal(mean, std)
+        pre_tanh_action = normal.rsample()
+        action = torch.tanh(pre_tanh_action)
+        log_prob = normal.log_prob(pre_tanh_action).sum(dim=-1, keepdim=True)
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6).sum(dim=-1, keepdim=True)
+        return action, log_prob
 
 class Critic(nn.Module):
     def __init__(self, state_dim, action_dim):
@@ -224,26 +248,31 @@ def train_awac():
                 critic_optimizer.zero_grad()
                 critic_loss.backward()
                 critic_optimizer.step()
-                
+
+                if episode % 10 == 0 and step == 0:
+                    print(f"[Episode {episode}] Critic Loss: {critic_loss.item():.4f}")
+
                 # Update actor using AWAC
                 q1, q2 = critic(state_batch, action_batch)
                 q = torch.min(q1, q2)
-                
-                # Calculate advantages
+
                 with torch.no_grad():
-                    policy_action = actor.sample(state_batch)
+                    policy_action, _ = actor.sample_with_log_prob(state_batch)
                     policy_q1, policy_q2 = critic(state_batch, policy_action)
                     policy_q = torch.min(policy_q1, policy_q2)
-                    advantage = (q - policy_q).unsqueeze(-1)
+                    advantage = q - policy_q  # advantage shape: [batch, 1]
                     weights = torch.exp(advantage / AWAC_LAMBDA)
                     weights = weights * (1 + is_demo_batch)  # Extra weight for demos
-                
-                actor_loss = -torch.mean(weights * q)
-                
+
+                action_sample, log_prob = actor.sample_with_log_prob(state_batch)
+                actor_loss = -torch.mean(weights * log_prob)
+
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 actor_optimizer.step()
-                
+
+                if episode % 10 == 0 and step == 0:
+                    print(f"[Episode {episode}] Actor Loss: {actor_loss.item():.4f}")
                 # Update target network
                 for param, target_param in zip(critic.parameters(), critic_target.parameters()):
                     target_param.data.copy_(TAU * param.data + (1 - TAU) * target_param.data)
