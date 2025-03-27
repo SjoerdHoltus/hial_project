@@ -1,14 +1,18 @@
 import os
 import numpy as np
 import torch
-from policy_learn import actNet
+from policy_learn import *
 from init_env import init_env
+from trajectory_utils import *
+
+
+MAX_STEPS = 150
 
 def load_final_policy(path_to_saved_policy):
     """
     Loads the final policy from a saved model file.
     """
-    full_path = os.path.join("models", path_to_saved_policy)
+    full_path = os.path.join("./models/", path_to_saved_policy)
     
     s_dim = 22
     a_dim = 4
@@ -36,5 +40,47 @@ def get_policy_action(state, saved_policy_model):
     action = action_tensor.cpu().numpy().squeeze(0)
     return action
 
+path = 'checkpoint_actor_50100.pth'
+video_filename = "final_policy_video.mp4"
+agent = load_final_policy(path)
+wts = load_weights("final_feature_weights.csv")
 
+# Initialize environment
+env = init_env(render=False)
 
+# Initial state
+state = env.reset()
+o = np.concatenate([state["observation"], state["achieved_goal"]])
+
+replay = ReplayBuf()
+
+done = False
+ep_steps = 0
+step_count = 0
+ep_reward = 0.0
+
+# Create a trajectory that the final policy follows
+traj = []
+
+print('starting the trajectory')
+while not done and ep_steps < MAX_STEPS:
+    action = get_policy_action(state, agent)
+    traj.append((state,action))
+    next_state, reward, env_done, info = env.step(action)
+    done = env_done
+    state = next_state
+    ep_steps += 1
+print('finished trajectory')
+
+traj.append((state, None))
+
+env.close()
+
+print("Trajectory generated with {} steps and total learned reward {:.2f}".format(ep_steps, ep_reward))
+
+env_record = init_env(render=False)
+starting_state = traj[0][0]['observation']
+frames = record_trajectory(env_record, traj, starting_state=starting_state)
+generate_clip(frames, video_filename, fps=30)
+
+print('video saved!')

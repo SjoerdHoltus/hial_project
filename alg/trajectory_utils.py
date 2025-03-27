@@ -36,17 +36,17 @@ def generate_trajectory(env, max_episode_length, save_dir, save_name, seed=None)
                 f.write(line)
     return traj
 
-def record_trajectory(env, trajectory, starting_state=None):
+def record_trajectory(env, trajectory, starting_state):
     """
     Record a trajectory from the environment.
     """
     frames = []
-    if not starting_state:
-        env.reset() # If no starting state, reset environment to initial state
-    else:
-        # If starting state, reset environment to starting state. 
-        # This is used to record expert trajectories (when we have a recorded starting state)
-        env.reset(whether_random=False, object_pos=starting_state[7:10])
+    # if not starting_state:
+    #     env.reset() # If no starting state, reset environment to initial state
+    # else:
+    #     # If starting state, reset environment to starting state. 
+    #     # This is used to record expert trajectories (when we have a recorded starting state)
+    env.reset(whether_random=False, object_pos=starting_state[7:10])
     
     for obs, act in trajectory:
         if act is None:
